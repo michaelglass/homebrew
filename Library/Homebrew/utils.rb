@@ -1,3 +1,39 @@
+class ExecutionError <RuntimeError
+  attr :exit_status
+  attr :command
+
+  def initialize cmd, args = [], es = nil
+    @command = cmd
+    super "Failure while executing: #{cmd} #{pretty(args)*' '}"
+    @exit_status = es.exitstatus rescue 1
+  end
+
+  def was_running_configure?
+    @command == './configure'
+  end
+
+  private
+
+  def pretty args
+    args.collect do |arg|
+      if arg.to_s.include? ' '
+        "'#{ arg.gsub "'", "\\'" }'"
+      else
+        arg
+      end
+    end
+  end
+end
+
+class BuildError <ExecutionError
+  attr :env
+
+  def initialize cmd, args = [], es = nil
+    super
+    @env = ENV.to_hash
+  end
+end
+
 class Tty
   class <<self
     def blue; bold 34; end
@@ -47,13 +83,7 @@ def pretty_duration s
 end
 
 def interactive_shell
-  fork do
-    # TODO make the PS1 var change pls
-    #brown="\[\033[0;33m\]"
-    #reset="\[\033[0m\]"
-    #ENV['PS1']="Homebrew-#{HOMEBREW_VERSION} #{brown}\W#{reset}\$ "
-    exec ENV['SHELL']
-  end
+  fork {exec ENV['SHELL'] }
   Process.wait
   unless $?.success?
     puts "Aborting due to non-zero exit status"
@@ -130,26 +160,33 @@ def gzip path
   return Pathname.new(path+".gz")
 end
 
-# Returns array of architectures that the given command is built for.
+module ArchitectureListExtension
+  def universal?
+    self.include? :i386 and self.include? :x86_64
+  end
+end
+
+# Returns array of architectures that the given command or library is built for.
 def archs_for_command cmd
   cmd = cmd.to_s # If we were passed a Pathname, turn it into a string.
   cmd = `/usr/bin/which #{cmd}` unless Pathname.new(cmd).absolute?
   cmd.gsub! ' ', '\\ '  # Escape spaces in the filename.
 
-  IO.popen("/usr/bin/file #{cmd}").readlines.inject(%w[]) do |archs, line|
+  archs = IO.popen("/usr/bin/file #{cmd}").readlines.inject([]) do |archs, line|
     case line
-    when /Mach-O executable ppc/
+    when /Mach-O (executable|dynamically linked shared library) ppc/
       archs << :ppc7400
-    when /Mach-O 64-bit executable ppc64/
+    when /Mach-O 64-bit (executable|dynamically linked shared library) ppc64/
       archs << :ppc64
-    when /Mach-O executable i386/
+    when /Mach-O (executable|dynamically linked shared library) i386/
       archs << :i386
-    when /Mach-O 64-bit executable x86_64/
+    when /Mach-O 64-bit (executable|dynamically linked shared library) x86_64/
       archs << :x86_64
     else
       archs
     end
   end
+  archs.extend(ArchitectureListExtension)
 end
 
 # String extensions added by inreplace below.
@@ -217,7 +254,20 @@ end
 def dump_build_env env
   puts "\"--use-llvm\" was specified" if ARGV.include? '--use-llvm'
 
-  %w[CC CXX LD CFLAGS CXXFLAGS CPPFLAGS LDFLAGS MACOSX_DEPLOYMENT_TARGET MAKEFLAGS PATH PKG_CONFIG_PATH HOMEBREW_USE_LLVM].each do |k|
+  %w[ CC CXX LD ].each do |k|
+    value = env[k]
+    if value
+      results = value
+      if File.exists? value and File.symlink? value
+        target = Pathname.new(value)
+        results += " => #{target.dirname+target.readlink}"
+      end
+      puts "#{k}: #{results}"
+    end
+  end
+
+  %w[ CFLAGS CXXFLAGS CPPFLAGS LDFLAGS MACOSX_DEPLOYMENT_TARGET MAKEFLAGS PKG_CONFIG_PATH
+      HOMEBREW_DEBUG HOMEBREW_VERBOSE HOMEBREW_USE_LLVM HOMEBREW_SVN ].each do |k|
     value = env[k]
     puts "#{k}: #{value}" if value
   end
